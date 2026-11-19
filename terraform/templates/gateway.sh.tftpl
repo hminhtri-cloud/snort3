@@ -1,0 +1,190 @@
+#!/bin/bash
+${common}
+
+hostnamectl set-hostname snort-gateway
+
+# Single-arm router: packet enters and leaves the same ENI. Do not masquerade.
+cat > /etc/sysctl.d/99-snort-gateway.conf <<'SYSCTL'
+net.ipv4.ip_forward = 1
+net.ipv4.conf.all.rp_filter = 0
+net.ipv4.conf.default.rp_filter = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+SYSCTL
+sysctl --system
+for path in /proc/sys/net/ipv4/conf/*/rp_filter /proc/sys/net/ipv4/conf/*/send_redirects; do
+    echo 0 > "$path"
+done
+
+retry apt-get -o DPkg::Lock::Timeout=300 install -y \
+    build-essential cmake autoconf automake libtool pkg-config flex bison \
+    libpcap-dev libpcre2-dev libdumbnet-dev libluajit-5.1-dev libhwloc-dev \
+    libssl-dev zlib1g-dev liblzma-dev uuid-dev libunwind-dev libhyperscan-dev \
+    libmnl-dev libnetfilter-queue-dev ethtool unzip
+
+install -d /opt/snort-src
+cd /opt/snort-src
+retry curl -fL --retry 5 -o libdaq.tar.gz https://github.com/snort3/libdaq/archive/refs/tags/v${daq_version}.tar.gz
+tar -xzf libdaq.tar.gz
+cd libdaq-${daq_version}
+./bootstrap
+./configure --prefix=/usr/local
+make -j2
+make install
+ldconfig
+
+cd /opt/snort-src
+retry curl -fL --retry 5 -o snort.tar.gz https://github.com/snort3/snort3/archive/refs/tags/${snort_version}.tar.gz
+tar -xzf snort.tar.gz
+cd snort3-${snort_version}
+export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/lib64/pkgconfig
+./configure_cmake.sh --prefix=/usr/local
+cmake --build build --parallel 2
+cmake --install build
+ldconfig
+/usr/local/bin/snort -V
+/usr/local/bin/snort --daq-list | tee /var/log/snort-daq-list.log
+
+install -d /usr/local/etc/snort/rules /var/log/snort
+touch /var/log/snort/alert_fast.txt
+chmod 0755 /var/log/snort
+chmod 0644 /var/log/snort/alert_fast.txt
+
+cat > /usr/local/etc/snort/rules/local.rules <<'RULES'
+alert icmp ${attacker_ip} any -> ${victim_ip} any (msg:"LAB ICMP echo to victim"; itype:8; sid:1000001; rev:1;)
+alert tcp ${attacker_ip} any -> ${victim_ip} any (msg:"LAB TCP SYN to victim"; flags:S; flow:stateless; sid:1000002; rev:1;)
+alert http ${attacker_ip} any -> ${victim_ip} any (msg:"LAB HTTP admin URI"; flow:to_server,established; http_uri; content:"/admin"; sid:1000003; rev:1;)
+RULES
+
+# Use a minimal explicit inspector/binder setup for this HTTP/ICMP/TCP lab.
+# snort_defaults.lua is installed from the exact source release above.
+cat > /usr/local/etc/snort/snort.lua <<'LUA'
+HOME_NET = '${victim_ip}/32'
+EXTERNAL_NET = '${attacker_ip}/32'
+include '/usr/local/etc/snort/snort_defaults.lua'
+stream = {}
+stream_ip = {}
+stream_icmp = {}
+stream_tcp = {}
+http_inspect = {}
+wizard = default_wizard
+binder = {
+    { when = { proto = 'tcp', ports = '80', role = 'server' }, use = { type = 'http_inspect' } },
+    { when = { service = 'http' }, use = { type = 'http_inspect' } },
+    { use = { type = 'wizard' } }
+}
+ips = {
+    variables = default_variables,
+    include = '/usr/local/etc/snort/rules/local.rules'
+}
+alert_fast = { file = true, packet = false }
+LUA
+
+# Detect enX0/ens5/eth0 at boot rather than hard-coding an AMI interface name.
+cat > /usr/local/bin/start-snort-lab <<'START'
+#!/bin/bash
+set -Eeuo pipefail
+iface=$(ip -o -4 route show default | python3 -c 'import sys; print(sys.stdin.readline().split()[4])')
+sysctl -w net.ipv4.ip_forward=1
+echo 0 > "/proc/sys/net/ipv4/conf/$iface/rp_filter"
+echo 0 > "/proc/sys/net/ipv4/conf/$iface/send_redirects"
+# Avoid misleading TCP checksum/segmentation observations in passive capture.
+ethtool -K "$iface" gro off lro off tso off gso off || true
+exec /usr/local/bin/snort -c /usr/local/etc/snort/snort.lua \
+    --daq afpacket --daq-mode passive --daq-dir /usr/local/lib/daq \
+    -i "$iface" -l /var/log/snort -A alert_fast -k none
+START
+chmod 0755 /usr/local/bin/start-snort-lab
+
+cat > /etc/systemd/system/snort.service <<'UNIT'
+[Unit]
+Description=Snort 3 passive IDS (AFPacket)
+Wants=network-online.target
+After=network-online.target
+[Service]
+Type=simple
+Environment=LUA_PATH=/usr/local/etc/snort/?.lua;;
+ExecStartPre=/usr/local/bin/snort -T -c /usr/local/etc/snort/snort.lua
+ExecStart=/usr/local/bin/start-snort-lab
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+cat > /etc/logrotate.d/snort-lab <<'ROTATE'
+/var/log/snort/alert_fast.txt {
+    daily
+    maxsize 50M
+    rotate 7
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+}
+ROTATE
+systemctl daemon-reload
+systemctl enable --now snort
+sleep 3
+systemctl is-active --quiet snort
+
+# CloudWatch Agent uses the EC2 role; no static AWS credentials on disk.
+retry curl -fL --retry 5 -o /tmp/amazon-cloudwatch-agent.deb \
+    https://amazoncloudwatch-agent.s3.amazonaws.com/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb
+dpkg -i /tmp/amazon-cloudwatch-agent.deb
+cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<'CW'
+{
+  "agent": { "region": "${aws_region}", "run_as_user": "root" },
+  "logs": {
+    "force_flush_interval": 5,
+    "logs_collected": {
+      "files": {
+        "collect_list": [{
+          "file_path": "/var/log/snort/alert_fast.txt",
+          "log_group_name": ${log_group_json},
+          "log_stream_name": "{instance_id}",
+          "timezone": "UTC"
+        }]
+      }
+    }
+  }
+}
+CW
+/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+    -a fetch-config -m ec2 -s \
+    -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+systemctl enable amazon-cloudwatch-agent
+
+# Keep manager/agent on the same 4.14 release series. Resolve the newest patch
+# in that series, like the official 4.14 manager installer.
+retry curl -fsSL -o /tmp/wazuh-key https://packages.wazuh.com/key/GPG-KEY-WAZUH
+gpg --batch --yes --dearmor -o /usr/share/keyrings/wazuh.gpg /tmp/wazuh-key
+chmod 0644 /usr/share/keyrings/wazuh.gpg
+echo 'deb [signed-by=/usr/share/keyrings/wazuh.gpg] https://packages.wazuh.com/4.x/apt/ stable main' > /etc/apt/sources.list.d/wazuh.list
+retry apt-get -o DPkg::Lock::Timeout=300 update
+agent_version=$(apt-cache madison wazuh-agent | python3 -c 'import sys; versions=[line.split("|")[1].strip() for line in sys.stdin if "|" in line]; print(next(v for v in versions if v.startswith("4.14.")))')
+WAZUH_MANAGER='${siem_ip}' WAZUH_REGISTRATION_SERVER='${siem_ip}' \
+    WAZUH_AGENT_NAME='snort-gateway' \
+    retry apt-get -o DPkg::Lock::Timeout=300 install -y "wazuh-agent=$agent_version"
+
+python3 - <<'PY'
+from pathlib import Path
+path = Path('/var/ossec/etc/ossec.conf')
+text = path.read_text()
+block = '''  <localfile>
+    <log_format>syslog</log_format>
+    <location>/var/log/snort/alert_fast.txt</location>
+  </localfile>
+'''
+if '/var/log/snort/alert_fast.txt' not in text:
+    text = text.replace('</ossec_config>', block + '</ossec_config>', 1)
+path.write_text(text)
+PY
+apt-mark hold wazuh-agent
+systemctl daemon-reload
+systemctl enable wazuh-agent
+systemctl restart wazuh-agent
+# Wazuh agent enrollment retries automatically while SIEM is still installing.
+touch /var/lib/snort-lab-bootstrap.done

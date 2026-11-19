@@ -1,0 +1,19 @@
+aws_region  = "us-east-1"
+project_name = "snort3-lab"
+
+# Thay bằng IP public hiện tại của bạn, không dùng IP private 10.x.
+admin_cidr = "203.0.113.10/32"
+
+# Dán NỘI DUNG file ~/.ssh/id_ed25519.pub hoặc public key của bạn.
+ssh_public_key = "ssh-ed25519 REPLACE_WITH_YOUR_PUBLIC_KEY"
+
+# Nếu log group cũ đã tồn tại, xem mục import trong README hoặc đổi tên.
+log_group_name = "/snort/gateway/alerts"
+log_retention_days = 14
+
+# Để mặc định dùng Ubuntu 24.04 LTS amd64 mới nhất từ Canonical.
+# ubuntu_ami_id = "ami-..."
+# availability_zone = "us-east-1a"
+
+snort_version = "3.12.2.0"
+daq_version   = "3.0.27"

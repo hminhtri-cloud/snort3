@@ -1,0 +1,23 @@
+#!/bin/bash
+${common}
+
+hostnamectl set-hostname snort-victim
+retry apt-get -o DPkg::Lock::Timeout=300 install -y nginx
+install -d /var/www/html/admin
+echo 'Snort 3 lab victim: normal home page' > /var/www/html/index.html
+echo 'Snort 3 lab: /admin request reached victim (passive IDS)' > /var/www/html/admin/index.html
+# Exact /admin response avoids a redirect, making the demo deterministic.
+cat > /etc/nginx/sites-available/default <<'NGINX'
+server {
+    listen 80 default_server;
+    server_name _;
+    root /var/www/html;
+    index index.html;
+    location = /admin { default_type text/plain; return 200 "Snort lab admin endpoint\n"; }
+    location / { try_files $uri $uri/ =404; }
+}
+NGINX
+nginx -t
+systemctl enable nginx
+systemctl restart nginx
+touch /var/lib/snort-lab-bootstrap.done

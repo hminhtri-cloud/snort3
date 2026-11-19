@@ -1,0 +1,21 @@
+#!/bin/bash
+${common}
+
+hostnamectl set-hostname snort-attacker
+retry apt-get -o DPkg::Lock::Timeout=300 install -y nmap traceroute
+
+cat > /usr/local/bin/snort-lab-demo <<'DEMO'
+#!/bin/bash
+set -Eeuo pipefail
+echo '== ICMP echo: expect SID 1000001 =='
+ping -c 4 ${victim_ip}
+echo '== TCP SYN: expect SID 1000002 =='
+sudo nmap -n -Pn -sS -p 1-100 ${victim_ip}
+echo '== HTTP /admin: expect SID 1000003 =='
+curl --noproxy '*' --fail --show-error --max-time 15 http://${victim_ip}/admin
+echo
+echo 'Compare with normal GET / (no HTTP SID 1000003 expected):'
+curl --noproxy '*' --fail --show-error --max-time 15 http://${victim_ip}/
+DEMO
+chmod 0755 /usr/local/bin/snort-lab-demo
+touch /var/lib/snort-lab-bootstrap.done
